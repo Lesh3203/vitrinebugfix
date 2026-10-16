@@ -887,7 +887,30 @@ static double wholeFrom(SGKaraokeLine *run, BOOL sweepsEstimates) {
 }
 
 - (BOOL)accessibilityActivate {
-    return self.activate ? self.activate() : NO;
+    if (self.activate) return self.activate();
+    return NO;
+}
+
+// Some Spotify builds wrap the lyric line views differently. Provide a small fallback tap handler so
+// a touch ended on the line still attempts the same activation/seek path rather than depending on a
+// single binary view class.
+- (void)commonTapHandler {
+    if (self.activate) {
+        self.activate();
+        return;
+    }
+    // If we're embedded in another wrapper which handles activation, try to call through as a fallback.
+    if (self.superview && [self.superview respondsToSelector:@selector(accessibilityActivate)]) {
+        #pragma clang diagnostic push
+        #pragma clang diagnostic ignored "-Warc-performSelector-leaks"
+        [self.superview performSelector:@selector(accessibilityActivate)];
+        #pragma clang diagnostic pop
+    }
+}
+
+- (void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event {
+    [super touchesEnded:touches withEvent:event];
+    if (touches.count) [self commonTapHandler];
 }
 
 // A text of the line set apart from its words, dim until the line is sung.
