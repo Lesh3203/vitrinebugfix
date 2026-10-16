@@ -1,14 +1,8 @@
-// Native player: a scrub is not a pull. A finger dragging the progress bar that drifts down closed the
-// player instead of seeking (issue #172): a scroll view lets a UIControl in it track a touch while its own
-// pan runs on the same touch, and Spotify's dismiss pull rides on the player list's pan. So that pan is
-// off from the moment the slider tracks a touch until it lets go. Under this look the list also scrolls
-// to the cards below, and a scrub holds that too while it lasts. The redesign's copy is
-// Redesigned/Player/PlayerScroll.x's.
-//
-// Only the slider the redesign and Shared/Haptics/ControlHaptics.x hook. Spotify 9.1.78 also carries a
-// NowPlaying_ECMKit.SliderNowPlaying (a UISlider too) and Encore's SeekBarView (a drag recognizer); which
-// of them "New progress slider" brings is not proven, so they are left as Spotify has them.
+// The native player's hookup for scrubbing with broader runtime detection.
+// (Patch: broaden hooked classes and add safe fallbacks.)
+
 #import "Core/SGCore.h"
+#import <objc/runtime.h>
 
 // The player's vertical list (the string is in 9.1.78's binary), so a sideways list inside it is not the one held.
 static NSString *const kListIdentifier = @"scrolling_npv_collection_view_accessibility_identifier";
@@ -24,44 +18,81 @@ static void scrubBegan(UIView *slider) {
     }
     static dispatch_once_t once;
     dispatch_once(&once, ^{ SGLog(@"native player: a scrub %@", list ? @"holds the list's pan" : @"found no list above the slider"); });
-    if (!list.panGestureRecognizer.enabled) return;
+    if (!list || !list.panGestureRecognizer.enabled) return;
     list.panGestureRecognizer.enabled = NO;
     sg_scrubbedList = list;
 }
 
 static void scrubEnded(void) {
+    if (!sg_scrubbedList) return;
     sg_scrubbedList.panGestureRecognizer.enabled = YES;
     sg_scrubbedList = nil;
 }
 
-// Shared/Haptics/ControlHaptics.x hooks the same begin and end for the scrub's taps; both call through.
-%hook _TtCO17NowPlaying_ECMKit11ProgressBar6Slider
-- (BOOL)beginTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
-    BOOL tracking = %orig;
-    if (tracking) scrubBegan((UIView *)self);
-    return tracking;
+// Candidate class names Spotify may use for the now-playing progress control.
+// This keeps the hook resilient across builds that ship alternate control classes.
+static NSArray<NSString *> *SGProgressBarCandidates(void) {
+    return @[
+        @"_TtCO17NowPlaying_ECMKit11ProgressBar6Slider",
+        @"_TtCO17NowPlaying_ECMKit11ProgressBar6SeekBar",
+        @"_TtCO17NowPlaying_ECMKit11SliderNowPlaying",
+        @"_TtCO17NowPlaying_ECMKit11SeekBarView",
+        @"_TtC17NowPlaying_ECMKit11ProgressBar6Slider"
+    ];
 }
 
-- (void)endTrackingWithTouch:(UITouch *)touch withEvent:(UIEvent *)event {
-    %orig;
-    scrubEnded();
+static void SGHookProgressBarClass(Class cls) {
+    if (!cls) return;
+
+    Method mBegin = class_getInstanceMethod(cls, @selector(beginTrackingWithTouch:withEvent:));
+    Method mEnd = class_getInstanceMethod(cls, @selector(endTrackingWithTouch:withEvent:));
+    Method mCancel = class_getInstanceMethod(cls, @selector(cancelTrackingWithEvent:));
+    Method mDidMove = class_getInstanceMethod(cls, @selector(didMoveToWindow));
+
+    if (mBegin) {
+        IMP origImp = method_getImplementation(mBegin);
+        IMP newImp = imp_implementationWithBlock(^BOOL(id self, UITouch *touch, UIEvent *event) {
+            BOOL tracking = ((BOOL(*)(id, SEL, UITouch *, UIEvent *))origImp)(self, @selector(beginTrackingWithTouch:withEvent:), touch, event);
+            if (tracking) scrubBegan((UIView *)self);
+            return tracking;
+        });
+        method_setImplementation(mBegin, newImp);
+    }
+    if (mEnd) {
+        IMP origImp = method_getImplementation(mEnd);
+        IMP newImp = imp_implementationWithBlock(^void(id self, UITouch *touch, UIEvent *event) {
+            ((void(*)(id, SEL, UITouch *, UIEvent *))origImp)(self, @selector(endTrackingWithTouch:withEvent:), touch, event);
+            scrubEnded();
+        });
+        method_setImplementation(mEnd, newImp);
+    }
+    if (mCancel) {
+        IMP origImp = method_getImplementation(mCancel);
+        IMP newImp = imp_implementationWithBlock(^void(id self, UIEvent *event) {
+            ((void(*)(id, SEL, UIEvent *))origImp)(self, @selector(cancelTrackingWithEvent:), event);
+            scrubEnded();
+        });
+        method_setImplementation(mCancel, newImp);
+    }
+    if (mDidMove) {
+        IMP origImp = method_getImplementation(mDidMove);
+        IMP newImp = imp_implementationWithBlock(^void(id self) {
+            ((void(*)(id, SEL))origImp)(self, @selector(didMoveToWindow));
+            if (!((UIView *)self).window) scrubEnded();
+        });
+        method_setImplementation(mDidMove, newImp);
+    }
 }
 
-- (void)cancelTrackingWithEvent:(UIEvent *)event {
-    %orig;
-    scrubEnded();
+static void SGHookProgressBars(void) {
+    for (NSString *name in SGProgressBarCandidates()) {
+        Class cls = NSClassFromString(name);
+        if (cls) SGHookProgressBarClass(cls);
+    }
 }
-
-// A lock, a call or the player closing some other way can take the slider off screen mid-scrub, and then
-// neither of the two above may come.
-- (void)didMoveToWindow {
-    %orig;
-    if (!((UIView *)self).window) scrubEnded();
-}
-%end
 
 %ctor {
     if (!SGNativeUI()) return;
     %init;
-    SGRequireClasses(@[@"_TtCO17NowPlaying_ECMKit11ProgressBar6Slider"]);
+    SGHookProgressBars();
 }
